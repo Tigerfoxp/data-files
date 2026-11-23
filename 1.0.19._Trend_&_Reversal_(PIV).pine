@@ -1,0 +1,483 @@
+// This Pine Script® code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © ProInvestView
+// Trend & Reversal (ProInvestView) v1.0.19 — 2026-10-29
+// Pine Script v6
+//
+// Changelog v1.0.19:
+//  - Active trendline creation moved from phTL[1]/plTL[1] → phTL/plTL (no extra 1-bar delay).
+//    This matches LuxAlgo's 'if ph and showExt' / 'if pl and showExt' behavior exactly and
+//    fixes the missing weekly support line (which was waiting an extra bar for confirmation).
+//  - Active line coordinates match LuxAlgo verbatim:
+//      set_xy1(n - offset, ph)              / set_xy2(n - offset + 1, ph - slope)
+//    where offset = tlSwingLen when backpaint=true, 0 otherwise.
+//  - Removed histLines/histIsRes arrays — history is rendered by plot() (LuxAlgo approach).
+//    Saves line objects and eliminates the previous overlapping-lines complexity.
+//  - All other logic (trend / stage / strength / BOS / CHoCH / trend-break / dashboard / alerts) unchanged.
+
+//@version=6
+indicator("Trend & Reversal (ProInvestView)", shorttitle="Trend & R (PIV)", overlay=true, max_lines_count=500, max_labels_count=500, max_bars_back=5000)
+
+// ============== НАСТРОЙКИ: SWING DETECTION ==============
+grpSwing = "Swing detection"
+swingLen     = input.int(5, "Swing lookback for BOS/CHoCH (bars)", minval=1, maxval=50, group=grpSwing)
+confirmBody  = input.bool(true, "Require body close for BOS/CHoCH", group=grpSwing, tooltip="Если включено — только закрытие тела за уровнем свинга считается пробоем.")
+
+// ============== НАСТРОЙКИ: TREND / STAGE ==============
+grpTrend = "Trend & Stage"
+maLenW       = input.int(30,  "Weekly MA length (W)",   minval=5,  maxval=100, group=grpTrend)
+maLenD       = input.int(150, "Daily MA length (D)",    minval=20, maxval=300, group=grpTrend)
+maLen4H      = input.int(150, "4H MA length (4H)",      minval=20, maxval=300, group=grpTrend)
+maLen1H      = input.int(150, "1H MA length (1H)",      minval=20, maxval=300, group=grpTrend)
+maLenLTF     = input.int(150, "LTF MA length (current)",minval=20, maxval=300, group=grpTrend)
+earlyBars    = input.int(20,  "Early stage max bars in trend",  minval=5,  maxval=100, group=grpTrend)
+lateBars     = input.int(100, "Late stage min bars in trend",   minval=20, maxval=500, group=grpTrend)
+earlyExtPct  = input.float(3.0,  "Early stage max extension from MA (%)", minval=0.5, step=0.5, group=grpTrend)
+lateExtPct   = input.float(15.0, "Late stage min extension from MA (%)",  minval=5.0, step=1.0, group=grpTrend)
+
+// ============== НАСТРОЙКИ: STRENGTH ==============
+grpStrength = "Strength"
+adxLen       = input.int(14, "ADX length", minval=5, maxval=50, group=grpStrength)
+adxThresh    = input.float(25.0, "ADX threshold (strong trend)", minval=10, step=1, group=grpStrength)
+swingRatioTh = input.float(1.2, "Swing ratio threshold (HL/LH)", minval=1.0, step=0.1, group=grpStrength)
+slopeATRth   = input.float(0.1, "EMA slope threshold (ATR/bar)", minval=0.01, step=0.01, group=grpStrength)
+r2Thresh     = input.float(0.6, "R² quality filter threshold", minval=0.3, maxval=0.9, step=0.05, group=grpStrength)
+hhllCountTh  = input.int(3, "Min consecutive HH/LL count", minval=2, maxval=10, group=grpStrength)
+volTrendTh   = input.float(1.2, "Volume trend ratio (impulse/correction)", minval=1.0, step=0.1, group=grpStrength)
+
+// ============== НАСТРОЙКИ: TRENDLINE (LuxAlgo) ==============
+grpTL = "Trendlines"
+tlSwingLen     = input.int(14, "Trendline swing lookback (LuxAlgo Length)", minval=2, maxval=50, group=grpTL, tooltip="Длина свинга для трендовых линий. Совпадает с параметром 'Length' в LuxAlgo.")
+tlMethod       = input.string("Atr", "Slope calculation method", options=["Atr","Stdev","Linreg"], group=grpTL)
+tlLength       = input.int(14, "Slope length", minval=5, maxval=50, group=grpTL)
+tlMult         = input.float(1.0, "Slope multiplier", minval=0.1, step=0.1, group=grpTL)
+backpaint      = input.bool(true, "Backpaint (offset lines to pivot)", group=grpTL)
+
+// ============== НАСТРОЙКИ: VISUAL ==============
+grpVisual = "Visual"
+showDashboard    = input.bool(true, "Show Dashboard", group=grpVisual)
+dashPosStr       = input.string("Bottom Left", "Dashboard position", options=["Top Right","Top Left","Bottom Right","Bottom Left"], group=grpVisual)
+showActiveLines  = input.bool(true, "Show active trendlines", group=grpVisual)
+showBOS          = input.bool(true, "Show BOS markers", group=grpVisual)
+showCHoCH        = input.bool(true, "Show CHoCH markers", group=grpVisual)
+showTrendBreak   = input.bool(true, "Show trend-break markers", group=grpVisual)
+showTooltip      = input.bool(true, "Show tooltips on markers", group=grpVisual)
+markerSizeOpt    = input.string("Normal", "Marker size", options=["Small","Normal","Large"], group=grpVisual)
+
+colUp        = input.color(#26a69a, "Up / Support color",    group=grpVisual)
+colDown      = input.color(#ef5350, "Down / Resistance color", group=grpVisual)
+colRange     = input.color(color.yellow, "Range color",        group=grpVisual)
+
+// ============== КОНСТАНТЫ ==============
+const int MAX_MARKERS = 200
+
+markerSizeLbl = markerSizeOpt == "Small" ? size.small : markerSizeOpt == "Large" ? size.large : size.normal
+
+// ============== TF VISIBILITY ==============
+curSec    = timeframe.in_seconds()
+showHTF1H = curSec > 0 and curSec < 3600
+showHTF4H = curSec > 0 and curSec < 14400
+showHTFD  = curSec > 0 and curSec < 86400
+showHTFW  = curSec > 0 and curSec < 604800
+
+// ============== HELPERS ==============
+qualityLabel(float sc) =>
+    sc < 40 ? "Слабый" : sc < 70 ? "Умеренный" : "Сильный"
+
+strengthColor(float sc) =>
+    sc < 40 ? color.red : sc < 70 ? color.yellow : color.green
+
+strengthBar(float sc) =>
+    int filled = math.round(sc / 10)
+    string s = ""
+    for i = 0 to 9
+        s := s + (i < filled ? "█" : "░")
+    s + " " + str.tostring(sc, "#.#") + "%"
+
+stageSegments(int stg, int trd) =>
+    string s = "○○○"
+    color  c = color.gray
+    if trd != 0
+        if stg == 1
+            s := "●○○"
+            c := color.green
+        else if stg == 2
+            s := "●●○"
+            c := color.green
+        else if stg == 3
+            s := "●●●"
+            c := color.orange
+    [s, c]
+
+maLenByTF(string tf) =>
+    (tf == "W" or tf == "1W") ? maLenW : (tf == "D" or tf == "1D") ? maLenD : tf == "240" ? maLen4H : tf == "60" ? maLen1H : maLenLTF
+
+tfLabel(string tf) =>
+    tf == "1"   ? "1m"  :
+     tf == "3"   ? "3m"  :
+     tf == "5"   ? "5m"  :
+     tf == "15"  ? "15m" :
+     tf == "30"  ? "30m" :
+     tf == "45"  ? "45m" :
+     tf == "60"  ? "1H"  :
+     tf == "120" ? "2H"  :
+     tf == "180" ? "3H"  :
+     tf == "240" ? "4H"  :
+     tf == "360" ? "6H"  :
+     tf == "480" ? "8H"  :
+     tf == "720" ? "12H" :
+     (tf == "D" or tf == "1D") ? "D" :
+     (tf == "W" or tf == "1W") ? "W" :
+     (tf == "M" or tf == "1M") ? "M" :
+     tf
+
+// ============== CORE FUNCTION (BOS/CHoCH uses swingLen) ==============
+f_trendCore() =>
+    float ph = ta.pivothigh(high, swingLen, swingLen)
+    float pl = ta.pivotlow(low, swingLen, swingLen)
+
+    var float lastSwingHigh = na
+    var float lastSwingLow  = na
+    var float prevSwingHigh = na
+    var float prevSwingLow  = na
+    var int   trendDir      = 0
+    var int   stage         = 0
+    var bool  inTransition  = false
+    var int   consecutiveHH = 0
+    var int   consecutiveLL = 0
+    var bool  lastBOS       = false
+    var bool  lastCHoCH     = false
+    var int   trendStartBar = na
+
+    if not na(ph)
+        prevSwingHigh := lastSwingHigh
+        lastSwingHigh := ph
+        if not na(prevSwingHigh)
+            consecutiveHH := ph > prevSwingHigh ? consecutiveHH + 1 : 0
+    if not na(pl)
+        prevSwingLow := lastSwingLow
+        lastSwingLow := pl
+        if not na(prevSwingLow)
+            consecutiveLL := pl < prevSwingLow ? consecutiveLL + 1 : 0
+
+    int newTrend = trendDir
+    if not inTransition
+        if not na(lastSwingHigh) and not na(lastSwingLow) and not na(prevSwingHigh) and not na(prevSwingLow)
+            bool hh = lastSwingHigh > prevSwingHigh
+            bool hl = lastSwingLow  > prevSwingLow
+            bool lh = lastSwingHigh < prevSwingHigh
+            bool ll = lastSwingLow  < prevSwingLow
+            if hh and hl
+                newTrend := 1
+            else if lh and ll
+                newTrend := -1
+            else
+                newTrend := 0
+
+    bool bos = false
+    bool choch = false
+    if not na(lastSwingHigh) and not na(lastSwingLow)
+        bool brokeUp   = confirmBody ? close > lastSwingHigh : high > lastSwingHigh
+        bool brokeDown = confirmBody ? close < lastSwingLow  : low  < lastSwingLow
+        if trendDir == 1
+            if brokeUp
+                bos := true
+            else if brokeDown
+                choch := true
+                newTrend := 0
+                inTransition := true
+        else if trendDir == -1
+            if brokeDown
+                bos := true
+            else if brokeUp
+                choch := true
+                newTrend := 0
+                inTransition := true
+        else
+            if inTransition
+                if brokeUp
+                    newTrend := 1
+                    inTransition := false
+                    bos := true
+                else if brokeDown
+                    newTrend := -1
+                    inTransition := false
+                    bos := true
+
+    trendDir := newTrend
+
+    bool bosEdge   = bos   and not lastBOS
+    bool chochEdge = choch and not lastCHoCH
+    lastBOS   := bos
+    lastCHoCH := choch
+
+    if trendDir != 0 and (trendDir != trendDir[1] or na(trendStartBar))
+        trendStartBar := bar_index
+    if trendDir == 0
+        trendStartBar := na
+    int barsInTrend = na(trendStartBar) ? 0 : bar_index - trendStartBar
+
+    int   maLen    = maLenByTF(timeframe.period)
+    float ma       = ta.sma(close, maLen)
+    float maSlope  = not na(ma) and not na(ma[1]) and ma[1] != 0 ? (ma - ma[1]) / ma[1] * 100 : 0.0
+    float atr14    = ta.atr(14)
+    float extPct   = ma != 0 and not na(ma) ? (close - ma) / ma * 100 : 0.0
+
+    int newStage = 0
+    if trendDir != 0
+        bool maRising = trendDir == 1 ? maSlope > 0 : maSlope < 0
+        if barsInTrend <= earlyBars and math.abs(extPct) <= earlyExtPct and maRising
+            newStage := 1
+        else if barsInTrend >= lateBars or math.abs(extPct) >= lateExtPct
+            newStage := 3
+        else
+            newStage := 2
+    stage := newStage
+
+    float strength = 0.0
+
+    [diP, diM, adxVal] = ta.dmi(adxLen, adxLen)
+    if not na(adxVal) and adxVal > adxThresh
+        strength += 20.0
+
+    float lastHL = (not na(lastSwingLow)  and not na(prevSwingLow))  ? (lastSwingLow  - prevSwingLow)  : na
+    float lastLH = (not na(lastSwingHigh) and not na(prevSwingHigh)) ? (lastSwingHigh - prevSwingHigh) : na
+    if not na(lastHL) and not na(lastLH) and math.abs(lastLH) > 0
+        float ratio = math.abs(lastHL) / math.abs(lastLH)
+        if trendDir == 1 and ratio > swingRatioTh
+            strength += 20.0
+        else if trendDir == -1 and ratio < 1.0 / swingRatioTh
+            strength += 20.0
+
+    float ema50    = ta.ema(close, 50)
+    float slopeATR = (atr14 != 0 and not na(atr14)) ? (ema50 - ema50[1]) / atr14 : 0.0
+    int   N        = 50
+    float sumX = 0.0, sumY = 0.0, sumXY = 0.0, sumX2 = 0.0, sumY2 = 0.0
+    for i = 0 to N - 1
+        sumX  += i
+        sumY  += close[i]
+        sumXY += i * close[i]
+        sumX2 += i * i
+        sumY2 += close[i] * close[i]
+    float r2 = 0.0
+    float denom  = N * sumX2 - sumX * sumX
+    float denom2 = N * sumY2 - sumY * sumY
+    if denom != 0 and denom2 > 0
+        float num  = N * sumXY - sumX * sumY
+        float corr = num / math.sqrt(denom * denom2)
+        r2 := corr * corr
+    bool slopeOk = (trendDir == 1 and slopeATR >  slopeATRth) or (trendDir == -1 and slopeATR < -slopeATRth)
+    if slopeOk and r2 > r2Thresh
+        strength += 15.0
+
+    if (trendDir == 1 and consecutiveHH >= hhllCountTh) or (trendDir == -1 and consecutiveLL >= hhllCountTh)
+        strength += 15.0
+
+    float volImp = 0.0, volCor = 0.0
+    int   cImp = 0, cCor = 0
+    for i = 0 to 9
+        if close[i] > open[i]
+            volImp += volume[i]
+            cImp   += 1
+        else if close[i] < open[i]
+            volCor += volume[i]
+            cCor   += 1
+    if cImp > 0 and cCor > 0
+        float avgImp = volImp / cImp
+        float avgCor = volCor / cCor
+        if (trendDir == 1 and avgImp > avgCor * volTrendTh) or (trendDir == -1 and avgCor > avgImp * volTrendTh)
+            strength += 10.0
+
+    strength := math.min(strength, 100)
+
+    [trendDir, stage, strength, bosEdge ? 1 : 0, chochEdge ? 1 : 0]
+
+// ============== CURRENT TF + HTF VALUES ==============
+[curTrend, curStage, curStrengthRaw, curBOS, curCHoCH] = f_trendCore()
+
+[t1hTrend, t1hStage, t1hStrength, t1hBOS, t1hCHoCH] = request.security(syminfo.tickerid, "60",  f_trendCore(), lookahead=barmerge.lookahead_off)
+[t4hTrend, t4hStage, t4hStrength, t4hBOS, t4hCHoCH] = request.security(syminfo.tickerid, "240", f_trendCore(), lookahead=barmerge.lookahead_off)
+[tDTrend,  tDStage,  tDStrength,  tDBOS,  tDCHoCH]  = request.security(syminfo.tickerid, "D",   f_trendCore(), lookahead=barmerge.lookahead_off)
+[tWTrend,  tWStage,  tWStrength,  tWBOS,  tWCHoCH]  = request.security(syminfo.tickerid, "W",   f_trendCore(), lookahead=barmerge.lookahead_off)
+
+// ============== HTF ALIGNMENT ==============
+int htfAgree = 0
+int htfTotal = 0
+if showHTF1H
+    htfTotal += 1
+    if t1hTrend == curTrend and curTrend != 0
+        htfAgree += 1
+if showHTF4H
+    htfTotal += 1
+    if t4hTrend == curTrend and curTrend != 0
+        htfAgree += 1
+if showHTFD
+    htfTotal += 1
+    if tDTrend == curTrend and curTrend != 0
+        htfAgree += 1
+if showHTFW
+    htfTotal += 1
+    if tWTrend == curTrend and curTrend != 0
+        htfAgree += 1
+
+float curStrength = curStrengthRaw
+if htfTotal > 0 and curTrend != 0
+    float alignRatio = htfAgree / htfTotal
+    if alignRatio > 0.5
+        curStrength += 20.0
+    curStrength := math.min(curStrength, 100)
+
+// ============== TRENDLINES — LuxAlgo verbatim (no [1] delay, plot for history) ==============
+float phTL = ta.pivothigh(high, tlSwingLen, tlSwingLen)
+float plTL = ta.pivotlow(low, tlSwingLen, tlSwingLen)
+
+float slope = switch tlMethod
+    "Atr"    => ta.atr(tlLength) / tlLength * tlMult
+    "Stdev"  => ta.stdev(close, tlLength) / tlLength * tlMult
+    "Linreg" => math.abs(ta.sma(close * bar_index, tlLength) - ta.sma(close, tlLength) * ta.sma(bar_index, tlLength)) / ta.variance(bar_index, tlLength) / 2 * tlMult
+    => 0.0
+
+var float upper    = na
+var float lower    = na
+var float slope_ph = 0.0
+var float slope_pl = 0.0
+
+slope_ph := not na(phTL) ? slope : nz(slope_ph[1], 0.0)
+slope_pl := not na(plTL) ? slope : nz(slope_pl[1], 0.0)
+upper    := not na(phTL) ? phTL  : na(upper[1]) ? na : upper[1] - slope_ph
+lower    := not na(plTL) ? plTL  : na(lower[1]) ? na : lower[1] + slope_pl
+
+// upos / dnos state machine (LuxAlgo)
+var int upos = 0
+var int dnos = 0
+upos := not na(phTL) ? 0 : na(upper) ? upos : close > upper - slope_ph * tlSwingLen ? 1 : upos
+dnos := not na(plTL) ? 0 : na(lower) ? dnos : close < lower + slope_pl * tlSwingLen ? 1 : dnos
+
+// Backpaint offset
+int bpOff = backpaint ? tlSwingLen : 0
+
+// Historical solid plots (LuxAlgo plot, shifted by -bpOff when backpaint)
+plot(backpaint ? upper : upper - slope_ph * tlSwingLen, "Upper line", color=not na(phTL) ? na : colUp,   offset=-bpOff, linewidth=1, force_overlay=true)
+plot(backpaint ? lower : lower + slope_pl * tlSwingLen, "Lower line", color=not na(plTL) ? na : colDown, offset=-bpOff, linewidth=1, force_overlay=true)
+
+// Active extension lines (var, updated on every pivot — LuxAlgo style)
+var line up_l = na
+var line dn_l = na
+
+if showActiveLines and not na(phTL)
+    float y1 = backpaint ? phTL : upper - slope_ph * tlSwingLen
+    float y2 = backpaint ? phTL - slope : upper - slope_ph * (tlSwingLen + 1)
+    int   x1 = bar_index - bpOff
+    int   x2 = bar_index - bpOff + 1
+    if na(up_l)
+        up_l := line.new(x1, y1, x2, y2, color=colUp, extend=extend.right, style=line.style_dashed, force_overlay=true)
+    else
+        line.set_xy1(up_l, x1, y1)
+        line.set_xy2(up_l, x2, y2)
+
+if showActiveLines and not na(plTL)
+    float y1 = backpaint ? plTL : lower + slope_pl * tlSwingLen
+    float y2 = backpaint ? plTL + slope : lower + slope_pl * (tlSwingLen + 1)
+    int   x1 = bar_index - bpOff
+    int   x2 = bar_index - bpOff + 1
+    if na(dn_l)
+        dn_l := line.new(x1, y1, x2, y2, color=colDown, extend=extend.right, style=line.style_dashed, force_overlay=true)
+    else
+        line.set_xy1(dn_l, x1, y1)
+        line.set_xy2(dn_l, x2, y2)
+
+// ============== TREND-BREAK MARKERS — LuxAlgo verbatim ==============
+bool upBreak = showTrendBreak and upos > upos[1]
+bool dnBreak = showTrendBreak and dnos > dnos[1]
+
+plotshape(upBreak ? low  : na, "Upper Break", shape.labelup,   location.absolute, colUp,   text="↑", textcolor=color.white, size=size.tiny, force_overlay=true)
+plotshape(dnBreak ? high : na, "Lower Break", shape.labeldown, location.absolute, colDown, text="↓", textcolor=color.white, size=size.tiny, force_overlay=true)
+
+// ============== BOS / CHoCH MARKERS ==============
+bool bosUp         = curBOS == 1   and curTrend == 1
+bool bosDown       = curBOS == 1   and curTrend == -1
+bool chochFromUp   = curCHoCH == 1 and curTrend[1] == 1
+bool chochFromDown = curCHoCH == 1 and curTrend[1] == -1
+
+var array<label> bosTips   = array.new<label>()
+var array<label> chochTips = array.new<label>()
+
+if showBOS and bosUp
+    string tip = "Пробой структуры (BOS)\nПродолжение тренда вверх: закрытие выше последнего свинг-хая\nСила тренда: " + str.tostring(curStrength, "#.#") + "%"
+    label lbl = label.new(bar_index, low, "▲", xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_none, textcolor=colUp, size=markerSizeLbl, tooltip=showTooltip ? tip : "", force_overlay=true)
+    array.push(bosTips, lbl)
+    while array.size(bosTips) > MAX_MARKERS
+        label.delete(array.shift(bosTips))
+
+if showBOS and bosDown
+    string tip = "Пробой структуры (BOS)\nПродолжение тренда вниз: закрытие ниже последнего свинг-лоя\nСила тренда: " + str.tostring(curStrength, "#.#") + "%"
+    label lbl = label.new(bar_index, high, "▼", xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_none, textcolor=colDown, size=markerSizeLbl, tooltip=showTooltip ? tip : "", force_overlay=true)
+    array.push(bosTips, lbl)
+    while array.size(bosTips) > MAX_MARKERS
+        label.delete(array.shift(bosTips))
+
+if showCHoCH and chochFromUp
+    string tip = "Смена характера (CHoCH)\nВозможный разворот: Up → Range\nСила тренда: " + str.tostring(curStrength, "#.#") + "%"
+    label lbl = label.new(bar_index, high, "⚠️", xloc=xloc.bar_index, yloc=yloc.abovebar, style=label.style_none, textcolor=color.orange, size=markerSizeLbl, tooltip=showTooltip ? tip : "", force_overlay=true)
+    array.push(chochTips, lbl)
+    while array.size(chochTips) > MAX_MARKERS
+        label.delete(array.shift(chochTips))
+
+if showCHoCH and chochFromDown
+    string tip = "Смена характера (CHoCH)\nВозможный разворот: Down → Range\nСила тренда: " + str.tostring(curStrength, "#.#") + "%"
+    label lbl = label.new(bar_index, low, "⚠️", xloc=xloc.bar_index, yloc=yloc.belowbar, style=label.style_none, textcolor=color.orange, size=markerSizeLbl, tooltip=showTooltip ? tip : "", force_overlay=true)
+    array.push(chochTips, lbl)
+    while array.size(chochTips) > MAX_MARKERS
+        label.delete(array.shift(chochTips))
+
+// ============== DASHBOARD ==============
+dashPos = dashPosStr == "Top Right" ? position.top_right : dashPosStr == "Top Left" ? position.top_left : dashPosStr == "Bottom Right" ? position.bottom_right : position.bottom_left
+var table dash = table.new(dashPos, 4, 6, border_width=1, border_color=color.new(color.gray, 70))
+
+f_addRow(int r, string tf, int trend, int stg, float str) =>
+    string trendSym = trend == 1 ? "▲" : trend == -1 ? "▼" : "◆"
+    color  trendCol = trend == 1 ? colUp : trend == -1 ? colDown : colRange
+    [stageStr, stageCol] = stageSegments(stg, trend)
+    string strBar = strengthBar(str)
+    color  strCol = strengthColor(str)
+    table.cell(dash, 0, r, tf,       text_color=color.white, text_size=size.tiny,   text_halign=text.align_left)
+    table.cell(dash, 1, r, trendSym, text_color=trendCol,   text_size=size.normal)
+    table.cell(dash, 2, r, stageStr, text_color=stageCol,   text_size=size.tiny)
+    table.cell(dash, 3, r, strBar,   text_color=strCol,     text_size=size.tiny)
+    true
+
+if showDashboard and barstate.islast
+    table.cell(dash, 0, 0, "TF",       bgcolor=color.new(color.gray, 80), text_color=color.gray, text_size=size.tiny, text_halign=text.align_left)
+    table.cell(dash, 1, 0, "Trend",    bgcolor=color.new(color.gray, 80), text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 2, 0, "Stage",    bgcolor=color.new(color.gray, 80), text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 3, 0, "Strength", bgcolor=color.new(color.gray, 80), text_color=color.gray, text_size=size.tiny)
+
+    f_addRow(1, tfLabel(timeframe.period), curTrend, curStage, curStrength)
+
+    int rIdx = 2
+    if showHTF1H
+        f_addRow(rIdx, "1H", t1hTrend, t1hStage, t1hStrength)
+        rIdx += 1
+    if showHTF4H
+        f_addRow(rIdx, "4H", t4hTrend, t4hStage, t4hStrength)
+        rIdx += 1
+    if showHTFD
+        f_addRow(rIdx, "D",  tDTrend, tDStage, tDStrength)
+        rIdx += 1
+    if showHTFW
+        f_addRow(rIdx, "W",  tWTrend, tWStage, tWStrength)
+        rIdx += 1
+
+// ============== ALERTS ==============
+bool trendChanged = curTrend != curTrend[1]
+
+alertcondition(trendChanged,      "Trend direction change",   "Trend direction changed")
+alertcondition(curCHoCH == 1,     "CHoCH detected",           "CHoCH: potential trend reversal")
+alertcondition(curBOS   == 1,     "BOS confirmed",            "BOS: structure break in trend direction")
+bool strengthDrop = curStrength < 40 and curStrength[1] >= 40
+alertcondition(strengthDrop,      "Strength drop below 40%",  "Trend strength weakened below 40%")
+bool allAlign = htfTotal > 0 and htfAgree == htfTotal and curTrend != 0
+alertcondition(allAlign,          "Multi-TF alignment",       "All visible HTFs aligned with current trend")
+
+if trendChanged
+    string dirTxt = curTrend == 1 ? "Вверх" : curTrend == -1 ? "Вниз" : "Range"
+    alert("Trend & R (PIV): " + syminfo.ticker + " " + timeframe.period + " — тренд сменился на " + dirTxt, alert.freq_once_per_bar_close)
